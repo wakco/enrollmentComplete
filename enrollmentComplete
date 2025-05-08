@@ -1,0 +1,1420 @@
+#!/bin/zsh
+# enrollmentComplete
+#
+# Written by Richard Smith @wakco
+#
+# This script is designed to handle the first initial steps after enrolling a Mac into Jamf Pro
+# While this might work from inside a package and/or from another MDM, it's basic design is to be
+# executed from a lone enrollmentComplete triggered policy in Jamf Pro.
+# NOTE: For non-american users, enrolment is spelled the american way (enrollment) in order to reduce
+#          confusion when working with Jamf Pro (an american made product).
+
+VERSION="5.2.1"
+
+# Commands
+########## (Full Path Names)
+# /bin, /sbin, /usr/bin, & /usr/sbin, are a normal part of $PATH and assumed, however anywhere else is not,
+# therefore declaring them here.
+
+C_JAMF="/usr/local/bin/jamf"
+C_JHELPER="/Library/Application\ Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper"
+C_INSTALL="/usr/local/Installomator/Installomator.sh"
+C_DIALOG="/usr/local/bin/dialog"
+C_MKUSER="/usr/local/bin/mkuser"
+
+# Alternative to defaults for more complex operations like embedded dicts and/or arrays.
+
+# Functions
+###########
+
+# This provides a quick and easy way to read JSON content.
+readJSON() {
+ JSON="$1" osascript -l 'JavaScript' \
+        -e 'const env = $.NSProcessInfo.processInfo.environment.objectForKey("JSON").js' \
+        -e "JSON.parse(env).$2"
+}
+
+# This will load the $JAMF_ADMIN and $JAMF_PASS login details
+getJamfAccount() {
+ JAMF_AUTH_TOKEN="$( readJSON "$( curl -s --location --request POST "${JAMF_URL}api/oauth/token" \
+	--header 'Content-Type: application/x-www-form-urlencoded' \
+	--data-urlencode "client_id=$API_ID" \
+	--data-urlencode 'grant_type=client_credentials' \
+	--data-urlencode "client_secret=$API_SECRET" )" "access_token" )"
+ sleep 1
+
+ JAMF_ACCOUNTS="$( curl -s "${JAMF_URL}api/v2/local-admin-password/$JAMF_MANAGEMENT_ID/accounts" \
+  -H "accept: application/json" -H "Authorization: Bearer $JAMF_AUTH_TOKEN" )"
+ for (( i = 0; i < $( readJSON "$JAMF_ACCOUNTS" "totalCount" ); i++ )); do
+  if [ "$( readJSON "$JAMF_ACCOUNTS" "results[$i].userSource" )" = "JMF" ]; then
+   JAMF_ADMIN="$( readJSON "$JAMF_ACCOUNTS" "results[$i].username" )"
+   break
+  fi
+ done
+ if [ -z "$JAMF_ADMIN" ]; then
+  logAndExit 11 "this should not have happened, unable to get Jamf Managed Account Details:\n$JAMF_AUTH_TOKEN\n$JAMF_ACCOUNTS"
+ fi
+ sleep 1
+
+ JAMF_PASS="$( readJSON "$( curl -s "${JAMF_URL}api/v2/local-admin-password/$JAMF_MANAGEMENT_ID/account/$JAMF_ADMIN/password" \
+  -H "accept: application/json" -H "Authorization: Bearer $JAMF_AUTH_TOKEN" )" "password" )"
+ if [ -z "$JAMF_PASS" ]; then
+  logAndExit 12 "this should not have happened, unable to get Jamf Managed Account Password:\n$JAMF_AUTH_TOKEN\n$JAMF_ACCOUNTS"
+ fi
+
+}
+
+# Basic logging function, logIt "message" and it attaches the date & PID to the entry, then sends it to the log file.
+logIt() {
+ MY_LOG_FILE="$LOG_FILE"
+ if [ -n "$2" ]; then
+  MY_LOG_FILE="$LOG_FILE-$2"
+ fi
+ echo "$( date ):$MY_PID:- $1" >> "$MY_LOG_FILE"
+}
+
+# Writes settings to our preferences file
+setIt() {
+ defaults write "$SETTINGS_FILE" "$1" "$2" 2>/dev/null
+}
+
+# Gets settings from our preferences file
+readIt() {
+ defaults read "$SETTINGS_FILE" "$1" 2>/dev/null
+}
+
+# Gets settings from our config. profile (managed preferences defaults file)
+defaultRead() {
+ defaults read "$DEFAULTS_FILE" "$1" 2>/dev/null
+}
+
+defaultReadBool() {
+ if [ "$( defaultRead $1 )" = "1" ]; then
+  echo "true"
+ else
+  echo "false"
+ fi
+}
+
+# This is for an enrollment process, the last thing we need is Jamf Pro to check-in while we are setting up, check-ins can wait.
+disableCheckIn() {
+ while [ "$( launchctl list | grep "com.jamfsoftware.task.Every" )" = "" ]; do
+  sleep 0.1
+ done
+ logIt "Disabling Jamf check-in"
+ launchctl bootout system "$JAMF_CHECKIN"
+}
+
+keepAwake() {
+ caffeinate -dimsuw $( pgrep "Self Service" ) &
+ while [ "$( pgrep "Self Service" )" != "" ] && [ "$( ps -axj | grep "$DEFAULTS_NAME success $PREF_DOMAIN")" = "" ]; do
+  "$C_JAMF" manage -stopConsoleLogs
+  sleep $(($PERAPP*60))
+  "$C_JAMF" recon -stopConsoleLogs -randomDelaySeconds $(($PERAPP*60))
+  sleep $(($PERAPP*60))
+ done
+}
+
+# Self Service seems to have a bad habit of stalling every now and then, a manage and/or recon seems to help it get going again.
+keepSSGoing() {
+ APP_LIST="${"$( defaultRead appLIST )":-""}"
+ ONBOARDED="$( readIt OnBoarding )"
+ rm -f "$APP_LIST"
+ if [ "$APP_LIST" != "" ] && [[ "$APP_LIST" != (LOG|Log|log) ]] && [ ! -e "$APP_LIST" ] && [ "$ONBOARDED" != "Skipped" ]; then
+  logIt "$( "$C_JAMF" manage )"
+  logIt "$( "$C_JAMF" recon -randomDelaySeconds $MYSLEEP )"
+  JAMF_SETTINGS="/Users/$WHO_LOGGED/Library/Preferences/com.jamfsoftware.selfservice.mac.plist"
+  while [ ! -e "$APP_LIST" ]; do
+   pkill "Self Service"
+   if [ -e "$JAMF_SETTINGS" ]; then
+    rm -f "$JAMF_SETTINGS"
+   fi
+   launchctl asuser $( id -u $WHO_LOGGED ) osascript -e "tell application \"Finder\" to open POSIX file \"$SELF_SERVICE\""
+   while [ -z "$( pgrep "Self Service" )" ]; do
+    sleep $MYSLEEP
+   done
+   keepAwake &
+   sleep $(($PERAPP*60))
+  done
+  caffeinate -dimsuw $( pgrep "Self Service" )
+ fi
+}
+
+# This is an attempt to tell the user what is happening
+updateUser() {
+ loopPIDfile="/tmp/loginwindowloopPID"
+ # Only used in this function
+
+ if [ -z "$1" ] && [ -z "$2" ]; then
+  logIt "Clearing LoginwindowText."
+  defaults delete "$LOGIN_PLIST" LoginwindowText
+ else
+  if ([ -n "$1" ] && [ -z "$2" ]) || ([ -z "$1" ] && [ -n "$2" ]) ; then
+   theText="Processing enrollment of $( scutil --get ComputerName ) into $JAMF_SERVER\n$1$2"
+  else
+   theText="$1\n$2"
+  fi
+  logIt "Updating LoginwindowText with: $theText"
+  defaults write "$LOGIN_PLIST" LoginwindowText "$theText"
+  # Cannot use -string here, as \n gets escaped.
+ fi
+ LOGINWINDOW_PROCESS="$( pgrep -lu "root" "loginwindow" )"
+ case "$3" in
+  block)
+   case "$NETWORK_CHECK" in
+    wired)
+     logIt "loginwindow wasn't running, and networkroute asked us to try a blackout notice."
+     "$C_JHELPER" -windowType utility -heading "$CORP_NAME" -description "$( echo "$theText" )" -icon "$DIALOG_ICON" &
+     # the $( echo "$theText" ) is because jamfHelper doesn't respect the \n convention.
+    ;;
+    wireless)
+     logIt "loginwindow wasn't running, and networkroute asked us to try a notice."
+     "$C_JHELPER" -windowType utility -heading "$CORP_NAME" -description "$( echo "$theText" )" -icon "$DIALOG_ICON" -button1 "OK" -defaultButton 1 &
+     # the $( echo "$theText" ) is because jamfHelper doesn't respect the \n convention.
+    ;;
+    *)
+     logIt "Something used block while calling updateUser, but NETWORK_CHECK is off, skipping"
+    ;;
+   esac
+  ;;
+  end)
+   # shutdown the loginwindow loop after giving it time to perform one last update
+   sleep $( if [ "$CPU_ARCH" = "arm64" ]; then echo "20" ; else echo "40" ; fi )
+   if [ -e "$loopPIDfile" ]; then
+    kill -9 "$( cat "$loopPIDfile" )"
+    logIt "loginwindow restart loop running on PID $( cat "$loopPIDfile" ) stopped."
+    rm -f "$loopPIDfile"
+   fi
+  ;;
+  start)
+  # Start the loginwindow restart loop
+   logIt "Checking for loginwindow process is running, and restart loop isn't already running."
+   if [ ! "$LOGINWINDOW_PROCESS" = "" ] && [ ! -e "$loopPIDfile" ]; then
+    loginwindowloop() {
+     logIt "loginwindow restart loop started." "loginwindow"
+     # required wait time for the loginwindow process to die and re-load
+     LOGINWINDOWTEXT="Not Valid"
+     # can't start with an empty string in case LoginWindowText was deleted first
+     LOGINWINDOW_PROCESS="$( pgrep -lu "root" "loginwindow" )"
+     while [ ! "$LOGINWINDOW_PROCESS" = "" ]; do
+      logIt "loginwindow Running, restarting it. PID $LOGINWINDOW_PROCESS." "loginwindow"
+      sleep 1
+      LOGINWINDOWTEXTNEW="$(defaults read "$LOGIN_PLIST" LoginwindowText)"
+      if [ "$LOGINWINDOWTEXT" = "$LOGINWINDOWTEXTNEW" ]; then
+       logIt "'$LOGINWINDOWTEXT' matches '$LOGINWINDOWTEXT' - loginwindow does not require reloading." "loginwindow"
+      else
+       logIt "'$LOGINWINDOWTEXT' does not match '$LOGINWINDOWTEXTNEW' - Reloading loginwindow." "loginwindow"
+       pkill loginwindow
+       LOGINWINDOWTEXT="$LOGINWINDOWTEXTNEW"
+      fi
+      sleep "$MYSLEEP"
+      LOGINWINDOW_PROCESS="$( pgrep -lu "root" "loginwindow" )"
+     done
+     logIt "loginwindow restart loop has ended, someone logged in." "loginwindow"
+     rm -f "$loopPIDfile"
+    }
+    loginwindowloop &
+    echo "$!" > "$loopPIDfile"
+    logIt "loginwindow restart loop started on PID $( cat "$loopPIDfile" )."
+   fi
+  ;&
+  *)
+   if [ "$LOGINWINDOW_PROCESS" = "" ]; then
+    logIt "loginwindow wasn't running, trying a notification instead."
+    # Use a notification instead.
+    # Maybe also perform a check to see if swiftDialog has installed yet and start using that once installed.
+    launchctl asuser "$( id -u "$WHO_LOGGED" )" osascript -e "display notification \"$theText\" with title \"Setup Progress...\""
+   fi
+  ;;
+ esac
+}
+
+# For handling sending an email
+# $1 = from address, $2 = to address, $3 = subject, $4 = body, $5 = visible to address (to hide the actual to address)
+# Microsoft and Apple mail servers expect CR/LF to end lines, so for maximum compatibility with mail servers the data is
+#   sent through a sed command to add a CR before every LF.
+mailSend() {
+ if [ "$EMAIL_AUTH" != "" ] && [ "$EMAIL_PASS" != "" ] && [[ "$EMAIL_SMTP" = *":"* ]]; then
+  curl -s -S --verbose --ssl-reqd --url "smtp://$EMAIL_SMTP" \
+     --mail-from "$1" \
+     ${AUTH_SMTP[@]} \
+     --mail-auth "$EMAIL_AUTH" \
+     --user "$EMAIL_AUTH:$( echo "$EMAIL_PASS" | base64 -d )" \
+     -T <( echo -e "From: $1\nTo: $2\nSubject: $3\n\n$4" | sed 's/$/\r/' ) >> "$LOG_FILE" 2>&1
+ else
+  EMAIL_SMTP_HOST="$( host -t mx "$( echo $2 | cut -d '@' -f 2 )" | head -1 | cut -d ' ' -f 7 ):25"
+  if [ "$5" = "" ]; then
+   BCCMAIL="$2"
+  else
+   BCCMAIL="$5"
+  fi
+  curl -s -S --verbose --url "smtp://$EMAIL_SMTP_HOST" \
+    	--mail-from "$1" \
+     --mail-rcpt "$2" \
+     -T <( echo -e "From: $1\nTo: $BCCMAIL\nSubject: $3\n\n$4" | sed 's/$/\r/' ) >> "$LOG_FILE" 2>&1
+ fi
+}
+
+# simple routine to log status of BootStrap and Secure Tokens
+logTokenStatus() {
+ logIt "profiles status -type bootstraptoken:\n$( profiles status -type bootstraptoken )"
+ logIt "fdesetup list -extended:\n$( fdesetup list -extended )"
+ logIt "/Users & /private/var:\n$( ls -lah /Users/ /private/var/ )"
+}
+
+# For handling when to exit, which will usually be for errors, this also handles sending emails if configured.
+logAndExit() {
+ networkInterface="$( route get $JAMF_SERVER | grep interface | awk '{ print $NF }' )"
+ # build email content
+ LAST_MESSAGE="$( if [ "$1" -gt 1 ]; then echo "Error: " ; fi )Exited with status $1 and message: $2"
+ ONBOARDED="$( readIt OnBoarding )"
+ FINISHED="$( date "+%s" )"
+ setIt OnBoardingFinished "$FINISHED"
+ # $LAST_MESSAGE is included in the email body (as below), and is the last logged message
+ EMAIL_BODY="$LAST_MESSAGE\n"
+ EMAIL_BODY+="\n"
+ EMAIL_BODY+="$( system_profiler SPHardwareDataType )\n"
+ EMAIL_BODY+="      MAC Address in use: $( ifconfig $networkInterface | grep ether | awk '{ print $NF }' )\n"
+ EMAIL_BODY+="      IP Address in use: $( ifconfig $networkInterface | grep "inet " | awk '{ print $2 }' )\n"
+ EMAIL_BODY+="      On Network Interface: $( networksetup -listnetworkserviceorder | grep -B1 $networkInterface )\n"
+ EMAIL_BODY+="\n"
+ EMAIL_BODY+="Script: $MY_SCRIPT\n"
+ EMAIL_BODY+="Enrollment Started: $( date -jur $( readIt Started ) ) ( $( date -jr $( readIt Started ) ) )\n"
+ EMAIL_BODY+="$( if [ "$ONBOARDED" != "" ]; then echo "OnBoarding Started: $( date -jur "$ONBOARDED") ( $( date -jr "$ONBOARDED" ) )"; else echo "Onboarding never started."; fi )\n"
+ EMAIL_BODY+="Enrollment $( if [ "$1" -gt 1 ]; then echo "Stopped"; else echo "Finished"; fi ): $( date -jur "$FINISHED" ) ( $( date -jr "$FINISHED" ) )\n"
+ EMAIL_BODY+="\n"
+ EMAIL_BODY+="Logs are available at ${JAMF_URL}computers.html?id=$JAMF_ID&o=r&v=history, or the $( readIt Log )* files on the computer.\n"
+ EMAIL_BODY+="Please review the logs and contact $SERVICE_NAME for assistance.\n"
+ EMAIL_BODY+="\n"
+ EMAIL_BODY+="\n"
+
+ APP_LIST="${"$( defaultRead appLIST )":-""}"
+ if [[ "$APP_LIST" = (LOG|Log|log) ]]; then
+  EMAIL_BODY+="$( cat "$( readIt Log )"(-s*|) )"
+ elif [ "$APP_LIST" != "" ]; then
+  EMAIL_BODY+="$EMAIL_LIST"
+ fi
+ if [ "$1" -lt 2 ]; then
+  if ${$( defaultReadBool emailSuccess ):-false} ; then
+   EMAIL_SUBJECT="OSDNotification: $( scutil --get ComputerName ) has "
+   if [[ "$EMAIL_BODY" = *(ERROR|Error|error|"following apps were not installed")* ]]; then
+    EMAIL_SUBJECT+="completed (with some failures)"
+   else
+    EMAIL_SUBJECT+="successfully completed"
+   fi
+   EMAIL_SUBJECT+=" $DEFAULTS_NAME from $JAMF_SERVER"
+  fi
+ else
+  EMAIL_SUBJECT="OSDNotification: $( scutil --get ComputerName ) Failed to complete $MY_SCRIPT from $JAMF_SERVER"
+  updateUser "! Enrollment of $( scutil --get ComputerName ) into $JAMF_SERVER Failed !" "$2" end
+ fi
+
+ EMAIL_FROM="${"$( defaultRead emailFrom )":-""}"
+ EMAIL_TO="${"$( defaultRead emailTo )":-""}"
+ EMAIL_ERR="${"$( defaultRead emailErrors )":-""}"
+ EMAIL_BCC="${"$( defaultRead emailBCC )":-""}"
+ EMAIL_HIDDEN="${"$( defaultRead emailBCCFiller )":-"$EMAIL_FROM"}"
+ EMAIL_SMTP="${"$( defaultRead emailSMTP )":-""}"
+ EMAIL_AUTH="${"$( defaultRead emailAUTH )":-"$EMAIL_FROM"}"
+ logIt "Email Details (if being sent):\nFrom: $EMAIL_FROM\nTo: $EMAIL_TO\nError: $EMAIL_ERR\nBCC: $EMAIL_BCC\nHidden by: $EMAIL_HIDDEN\nSubject: $EMAIL_SUBJECT\nFile added: $EMAIL_FILE\n\n$EMAIL_BODY\n"
+ if [ "$EMAIL_AUTH" != "" ] && [ "$EMAIL_PASS" != "" ] && [[ "$EMAIL_SMTP" = *":"* ]]; then
+  if [ "$EMAIL_FROM" != "" ] && [ "$EMAIL_SUBJECT" != "" ]; then
+   logIt "From, and Subject is configured, attempting to send emails"
+   AUTH_SMTP=()
+   if [ "$EMAIL_TO" != "" ]; then
+    logIt "To address configured"
+    AUTH_SMTP+=( "--mail-rcpt" )
+    AUTH_SMTP+=( "$EMAIL_TO" )
+   fi
+   if [ "$EMAIL_ERR" != "" ] && [ "$1" -gt 0 ]; then
+    logIt "Error address configured"
+    AUTH_SMTP+=( "--mail-rcpt" )
+    AUTH_SMTP+=( "$EMAIL_ERR" )
+   fi
+   if [ "$EMAIL_BCC" != "" ]; then
+    logIt "BCC address configured"
+    AUTH_SMTP+=( "--mail-rcpt" )
+    AUTH_SMTP+=( "$EMAIL_BCC" )
+   fi
+   if [[ "$AUTH_SMTP" = *"--mail-rcpt"* ]]; then
+    logIt "Sending email"
+    mailSend "$EMAIL_FROM" "$EMAIL_HIDDEN" "$EMAIL_SUBJECT" "$EMAIL_BODY"
+   fi
+  fi
+ else
+  if [ "$EMAIL_FROM" != "" ] && [ "$EMAIL_SUBJECT" != "" ]; then
+   logIt "From, and Subject is configured, attempting to send emails"
+   if [ "$EMAIL_TO" != "" ]; then
+    logIt "To address configured, sending email"
+    mailSend "$EMAIL_FROM" "$EMAIL_TO" "$EMAIL_SUBJECT" "$EMAIL_BODY" "$EMAIL_HIDDEN"
+    sleep 5
+   fi
+   if [ "$EMAIL_ERR" != "" ] && [ "$1" -gt 0 ]; then
+    logIt "Error address configured, sending email"
+    mailSend "$EMAIL_FROM" "$EMAIL_ERR" "$EMAIL_SUBJECT" "$EMAIL_BODY" "$EMAIL_HIDDEN"
+    sleep 5
+   fi
+   if [ "$EMAIL_BCC" != "" ]; then
+    logIt "BCC address configured, sending email"
+    mailSend "$EMAIL_FROM" "$EMAIL_BCC" "$EMAIL_SUBJECT" "$EMAIL_BODY" "$EMAIL_HIDDEN"
+   fi
+  fi
+ fi
+ logTokenStatus
+ logIt "$LAST_MESSAGE"
+ cat "$LOG_FILE"
+ if [ "$( pgrep "Finder" )" != "" ] && [[ "$EMAIL_BODY" = *(ERROR|Error|error|"following apps were not installed")* ]]; then
+  EMAIL_FILE="/Library/Logs/$DEFAULTS_NAME-$( date -j "+%Y%m%d-%H%M%S" )-email.txt"
+  echo "$EMAIL_SUBJECT\n$EMAIL_BODY" > "$EMAIL_FILE"
+  sleep 5
+  launchctl asuser $( id -u $WHO_LOGGED ) osascript -e "tell application \"TextEdit\" to open POSIX file \"$EMAIL_FILE\""
+ fi
+ exit $1
+}
+
+# This identifies the network connection the computer is using to talk to Jamf Pro
+networkPath() {
+ checkRoute="$( route get "$JAMF_SERVER" 2>&1 )"
+ if [ "$checkRoute" = "route: bad address: $JAMF_SERVER" ]; then
+  echo "Not Connected"
+ else
+  if [ ! "$( networksetup -listnetworkserviceorder | grep "Wi-Fi" | grep $( echo "$checkRoute" | grep interface | awk '{ print $NF }' ) )" = "" ]; then
+   echo "Connected over Wi-Fi"
+  else
+   echo "Wired"
+  fi
+ fi
+}
+
+# Using networkPath, this will stop everything and wait for an alternate network connection if our connection is wireless.
+networkRoute() {
+ case "$NETWORK_CHECK" in
+  wired)
+   logIt "Checking network is Wired."
+   firstrun=true
+   theNetworkPath="$( networkPath )"
+   while [ ! "$theNetworkPath" = "Wired" ]; do
+    if [ $firstrun = true ]; then
+     logIt "Primary network interface is $theNetworkPath, stalling until plugged into a wired network."
+     updateUser "Error: Primary network interface detected as $theNetworkPath," "Please connect this computer into a wired network connection, and the enrollment will continue..." block
+     firstrun=false
+    fi
+    sleep 30
+    theNetworkPath="$( networkPath )"
+   done
+   jamfHelperPID="$( pgrep -lu "root" "jamfHelper" )"
+   if [ ! "$jamfHelperPID" = "" ]; then
+    logIt "jamfHelper Running, killing it. PID $jamfHelperPID."
+    sleep 1
+    pkill jamfHelper
+   fi
+   logIt "Network is $theNetworkPath, continuing..."
+  ;;
+  wireless)
+   logIt "Checking network is Wired, but allowing a wireless network..."
+   theNetworkPath="$( networkPath )"
+   userMessageone="WARNING: Primary network interface detected as $theNetworkPath,"
+   usermessagetwo="A wired network connection is highly recommended, however enrollment is continuing..."
+   if ! $WIRELESS_WARNED && [ ! "$( pgrep -lu "root" "loginwindow" )" = "" ]; then
+    updateUser "$userMessage" "$usermessagetwo" block
+    WIRELESS_WARNED=true
+   else
+    updateUser "$userMessage" "$usermessagetwo"
+   fi
+  ;;
+  *)
+   logIt "Network checking not required, skilling..."
+  ;;
+ esac
+}
+
+# Defining the deployment loop, using DEPLOYMENT_ARRAY with lines configured as below.
+# Basic usage: seperated by Tabs (\t)
+# "Display message\tCommand Type\tCommand\tArchitecture"
+# Display message, Command Type, and Command are required. Architecture is optional.
+# Examples:
+# Jamf policy: "Display message\tpolicy\tcustom event name" i.e. "Installing Installomator from Github to help with installing\tpolicy\tInstallInstallomator"
+# Basic Shell command: "Display message\tcommand\tshell command" i.e. "Installing Rosetta 2\tcommand\tsoftwareupdate --install-rosetta --agree-to-license 2>/dev/null\tarm64"
+# Installomator label: "Display message\tinstall\tInstallomator label" i.e "Installing swiftDialog\tinstall\tdialog"
+# installomator "valuesfromarguments" minimum: "Display message\tinstall\tvaluesfromarguments name=name type=type downloadURL=\"URL\" expectedTeamID=AppleDeveloperTeamID"
+#    i.e. "Installing mkuser from Github using Installomator\tinstall\tvaluesfromarguments name=mkuser type=pkg downloadURL=\"\\\$(downloadURLFromGit freegeek-pdx mkuser)\"\tYRW6NUGA63"
+# or with more options: "Display message\tinstall\tvaluesfromarguments name=name type=type downloadURL=\"URL\" expectedTeamID=AppleDeveloperTeamID packageID=packageID appNewVersion=\"URL\""
+#    i.e. "Installing mkuser from Github using Installomator\tinstall\tvaluesfromarguments name=mkuser type=pkg downloadURL=\"\\\$(downloadURLFromGit freegeek-pdx mkuser)\"\tYRW6NUGA63" packageID=org.freegeek.pkg.mkuser appNewVersion="\\\$(versionFromGit freegeek-pdx mkuser)\""
+deployLoop() {
+ ERR_NO="$1"
+ # Loop for deployments
+ for DEPLOYMENT in "${DEPLOYMENT_ARRAY[@]}"; do
+  # First perform a network check.
+  networkRoute
+  DEPLOY_DESC="$( echo "$DEPLOYMENT" | cut -f 1 )"
+  DEPLOY_TYPE="$( echo "$DEPLOYMENT" | cut -f 2 )"
+  DEPLOY_COMMAND="$( echo "$DEPLOYMENT" | cut -f 3 )"
+  DEPLOY_ARCH="$( echo "$DEPLOYMENT" | cut -f 4 )"
+  DEPLOY_CHECK="$( echo "$DEPLOYMENT" | cut -f 5 )"
+  # the default delimiter for cut is a tab, so we are taking advantage of that.
+  ((ERR_NO++))
+  logIt "policyType = $DEPLOY_TYPE , policyCommand = $DEPLOY_COMMAND , installationCheck = $DEPLOY_CHECK"
+  if [ "$DEPLOY_ARCH" = "arm64" ] && [ ! "$CPU_ARCH" = "arm64" ] || [ "$DEPLOY_ARCH" = "x386" ] && [ "$CPU_ARCH" = "arm64" ]; then
+   logIt "Architecture mis-match, skipping '$DEPLOY_DESC', as deployment type is $DEPLOY_ARCH, and CPU is $CPU_ARCH."
+   continue # processor specific policies only need to execute on their own processor, so we are skipping mis-matched processor types.
+  fi
+  updateUser "$DEPLOY_DESC"
+  NOTINSTALLED=true
+  while $NOTINSTALLED; do
+   case "$DEPLOY_TYPE" in
+    install)
+     logIt "Installing: $DEPLOY_COMMAND."
+     COMMAND_CHECK="$( eval "$C_INSTALL $DEPLOY_COMMAND NOTIFY=silent $GITHUB_AUTH" )"
+    ;;
+    command)
+     logIt "Running command: $DEPLOY_COMMAND."
+     COMMAND_CHECK="$( eval "$DEPLOY_COMMAND" )"
+    ;;
+    policy)
+     logIt "Running jamf policy: $DEPLOY_COMMAND."
+     COMMAND_CHECK="$( "$C_JAMF" policy -event "$DEPLOY_COMMAND" )"
+    ;;
+    *)
+     COMMAND_CHECK="Error: Don't know what to do with $DEPLOY_COMMAND"
+    ;;
+   esac
+   logIt "$COMMAND_CHECK"
+   if [[ "$COMMAND_CHECK" = *"Error"* ]]; then
+    logAndExit $ERR_NO "An error was recorded:\n\n$COMMAND_CHECK"
+    # mailsend "An error was recorded:\n\n$COMMAND_CHECK" # fail and exit routine
+    # No computer name is a complete failure
+   fi
+   logIt "Sleeping for 5 seconds."
+   sleep 5
+   # just to seperate each run through.
+   if [ "$DEPLOY_CHECK" = "" ]; then
+    NOTINSTALLED=false
+   elif [ "$( ls "$DEPLOY_CHECK" )" != "" ]; then
+    NOTINSTALLED=false
+   else
+    logIt "$DEPLOY_CHECK not found trying again"
+   fi
+  done
+ done
+}
+
+# createAdmin username realname
+createAdmin() {
+ addUser="$C_MKUSER"
+ addUser+=" --username \"$1\""
+ case "$1" in
+  $TEMP_ADMIN)
+   THE_NAME="$TEMP_NAME"
+  ;;
+  $LAPS_ADMIN)
+   THE_NAME="$LAPS_NAME"
+  ;;
+  $JAMF_ADMIN)
+   THE_NAME="$1 Account"
+  ;;
+  *)
+   THE_NAME="$1's Account"
+  ;;
+ esac
+ addUser+=" --password \"$2\""
+ addUser+=" --real-name \"$THE_NAME\""
+ case "$1" in
+  $TEMP_ADMIN)
+   addUser+=" --home \"/Users/$1\" --hidden userOnly --prohibit-user-password-changes --automatic-login"
+  ;;
+  $LAPS_ADMIN|$JAMF_ADMIN)
+   addUser+=" --home \"/private/var/$1\" --hidden"
+  ;;
+  *)
+   # why are we creating another admin account?!?
+  ;;
+ esac
+ if [ "$5" != "skipchecks" ]; then
+  if [ -e "/Users/$1" ] || [ -e "/private/var/$1" ] || [ "$( dscl . read "/Users/$THE_ADMIN" 2>&1 | grep -c eDSRecordNotFound )" = 0 ]; then
+   # Just in case clean up and remove an existing account. Should not be triggered on first execution during PreStage enrollment.
+   logIt "Found a profile exists for $1 that will conflict when attempting to create the account, attempting clean up before adding.\n$( ls /private/var/ /Users/ ; dscl . read "/Users/$THE_ADMIN" 2>&1 )"
+   sysadminctl -deleteUser "$1" -adminUser "$2" -adminPassword "$3" >> "$LOG_FILE" 2>&1
+   sleep 10
+   rm -rf "/Users/$1" "/private/var/$1"
+  fi
+  REMOVE_ACCOUNT="$( dscl . search /Users RealName "$THE_NAME" | head -1 | cut -f 1 )"
+  if [ -n "$REMOVE_ACCOUNT" ]; then
+   # Just in case clean up and remove any conflicting accounts (with matching Real Name). Should not be triggered during PreStage enrollment.
+   logIt "Found a profile exists for $REMOVE_ACCOUNT that will conflict with $1 when attempting to create the account, attempting clean up before adding.$( ls /private/var/ /Users/ ; dscl . read "/Users/$THE_ADMIN" 2>&1 )"
+   sysadminctl -deleteUser "$REMOVE_ACCOUNT" -adminUser "$2" -adminPassword "$3" >> "$LOG_FILE" 2>&1
+   sleep 10
+   rm -rf "/Users/$REMOVE_ACCOUNT" "/private/var/$REMOVE_ACCOUNT"
+  fi
+ fi
+ if [ -n "$ADMIN_PICTURE" ]; then
+  addUser+=" --picture \"$ADMIN_PICTURE\""
+ else
+  addUser+=" --no-picture"
+ fi
+ addUser+=" --skip-setup-assistant firstLoginOnly"
+ addUser+=" --administrator --do-not-confirm"
+ addUser+=" --do-not-share-public-folder --prohibit-user-picture-changes"
+ if [ -n "$3" ] && [ -n "$4" ]; then
+  addUser+=" --secure-token-admin-account-name \"$3\" --secure-token-admin-password \"$4\""
+ fi
+ # In a coming update to mkuser, is an officially undocumented feature to make sure mkuser does not check for duplicate network accounts.
+ # In this script it would be used for re-enrollments to make sure the admin accounts are both created and local only.
+ # Although, in this case I might get it to unbind the ad connection before the accounts are handled, and therefore allowing the bind to happen regardless.
+ # if [ "$4" = "localonly" ]; then
+ #  addThis "--only-check-for-duplicate-user-name-locally"
+ # fi
+ logIt "Creating $1"
+ eval "$addUser" >> "$LOG_FILE" 2>&1
+}
+
+
+# Files and variables from Jamf Pro
+###################################
+
+LOGIN_PLIST="/Library/Preferences/com.apple.loginwindow.plist"
+# To change some login window settings
+JAMF_CHECKIN="/Library/LaunchDaemons/com.jamfsoftware.task.1.plist"
+# for disabling and re-enabling
+
+if [ "$1" = '/' ]; then
+ PREF_DOMAIN="${4:-"nz.co.wak"}"
+else
+ PREF_DOMAIN="${2:-"nz.co.wak"}"
+fi
+# To look for and save settings
+DEFAULTS_NAME="$PREF_DOMAIN.enrollmentComplete"
+DEFAULTS_FILE="/Library/Managed Preferences/$DEFAULTS_NAME.plist"
+SETTINGS_FILE="/Library/Preferences/$DEFAULTS_NAME.plist"
+# A place to store stuff (better description to come)
+STARTUPFILE="/usr/local/bin/$DEFAULTS_NAME"
+
+if [ "$1" = '/' ]; then
+ LOG_FILE="/Library/Logs/$DEFAULTS_NAME-$( date -j "+%Y%m%d-%H%M%S" ).log"
+ mkdir -p "$( dirname "$LOG_FILE" )"
+ echo "Starting $DEFAULTS_NAME script version $VERSION for $PREF_DOMAIN" > "$LOG_FILE"
+ setIt Log "$LOG_FILE"
+ setIt Version "$VERSION"
+ setIt Started "$( date "+%s" )"
+ disableCheckIn &
+ # Backgrounded, as there is no reason to wait for this.
+ logIt "Started monitoring for Jamf Pro check-in to disable it on PID ($!)."
+else
+ LOG_FILE="$( readIt Log )-$1"
+ echo "Starting $DEFAULTS_NAME script version $VERSION for $PREF_DOMAIN with command $1" > "$LOG_FILE"
+fi
+# Our log file
+# Resetting the log file (in case of a re-enrolment)
+
+# Variables
+###########
+
+# Using the legacy method to capture the _mbsetupuser username, required to identify a PreStage enrollment.
+# Jamfs $3 and the modern scutil method both return an empty string, making PreStage enrollments harder to detect.
+# The if statement is because if the Mac has just been setup _mbsetupuser and whomever is logged in will both be listed,
+#  and we need the logged in user, not _mbsetupuser to identify a manual enrollment.
+
+JAMF_URL="$( defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url )"
+JAMF_SERVER="$( echo "$JAMF_URL" | cut -d '/' -f 3 | cut -d ':' -f 1 )"
+SELF_SERVICE="$( defaults read /Library/Preferences/com.jamfsoftware.jamf.plist self_service_app_path )"
+# Jamf Pro Server details for logging, user feeback, and network checking.
+
+CPU_ARCH="$( arch )"
+# Useful to know, as Apple Silicon Macs usually need Rosetta 2 installed, which is not automatically installed by Apple.
+
+MYSLEEP=40
+# Intel & Default
+if [ "$CPU_ARCH" = "arm64" ]; then
+ MYSLEEP=20
+ # Apple Silicon
+fi
+# Due to SOC nature of Apple Silicon a number of features that require waiting for can be performed that much sooner.
+
+MY_PID=$$
+# Useful to know, used for logging, and as a unique identifier for this script.
+# Primarily for use inside functions, where the function might get its own PID.
+# And stay awake
+caffeinate -dimsuw $MY_PID &
+
+MY_SCRIPT="$0"
+
+# Jamf Pro now sends formatted emails, however it's not properly handling logs, this should fix that
+echo "<pre>\r\n\r\n"
+echo "===== Starting enrollmentComplete Script v$VERSION at $(date) ====="
+echo "== Executing with PID $MY_PID from: $MY_SCRIPT"
+
+# Wait for config file
+COUNT=300
+while [ ! -e "$DEFAULTS_FILE" ] && [ $COUNT -gt 0 ]; do
+ sleep 1
+ ((COUNT--))
+done
+if [ ! -e "$DEFAULTS_FILE" ] && [ $COUNT = 0 ]; then
+ logAndExit 2 "Waited for Defaults file $DEFAULTS_FILE, could not find it after 5 minutes"
+fi
+
+JAMF_MANAGEMENT_ID="${"$( defaultRead managementID )":-""}"
+JAMF_ID="${"$( defaultRead jssID )":-""}"
+# The Management ID, and JSS ID are required
+COUNT=300
+while [ $COUNT -gt 0 ] && ([ "$JAMF_ID" = "" ] || [ "$JAMF_MANAGEMENT_ID" = "" ]); do
+ sleep 1
+ ((COUNT--))
+ if [ "$JAMF_MANAGEMENT_ID" = "" ]; then
+  JAMF_MANAGEMENT_ID="${"$( defaultRead managementID )":-""}"
+ fi
+ if [ "$JAMF_ID" = "" ]; then
+  JAMF_ID="${"$( defaultRead jssID )":-""}"
+ fi
+done
+if [ $COUNT = 0 ] && ([ "$JAMF_ID" = "" ] || [ "$JAMF_MANAGEMENT_ID" = "" ]); then
+ logAndExit 3 "Something is wrong with the Managed Preferences file?\nJSS ID: $JAMF_ID, Management ID: $JAMF_MANAGEMENT_ID"
+fi
+logIt "JSS ID: $JAMF_ID, Management ID: $JAMF_MANAGEMENT_ID"
+PERAPP=${"$( defaultRead perAPP )":-"5"}
+
+if [ "$( who | grep console | wc -l )" -gt 1 ]; then
+ WHO_LOGGED="$( who | grep -v mbsetupuser | grep -m1 console | cut -d " " -f 1 )"
+else
+ WHO_LOGGED="$( who | grep -m1 console | cut -d " " -f 1 )"
+fi
+
+ADMIN_PICTURE="${"$( defaultRead adminPicture )":-""}"
+# A path to an image, if left empty, mkuser will be set to --no-picture.
+DIALOG_ICON="${"$( defaultRead dialogIcon )":-"caution"}"
+# A path to an image, if left empty, various dialogs will not not an icon.
+CORP_NAME="${"$( defaultRead corpName )":-"The Service Desk"}"
+# A string used in dialogs to identify ownership or management of the device.
+SERVICE_NAME="${"$( defaultRead serviceName )":-"Service Management"}"
+# A string used in emails to define support of the enrollment process.
+logIt "Customisations:
+Admin Picture Location: $ADMIN_PICTURE
+Dialog Icon Location: $DIALOG_ICON
+Corporate Name: $CORP_NAME
+Service/Support Name: $SERVICE_NAME"
+
+# Lets get started
+##################
+
+if [ "$1" = "/" ]; then
+
+ logIt "enrollmentComplete Script version $VERSION, Started."
+
+ logIt "Log file at: $LOG_FILE"
+
+ logIt "Logged in: $WHO_LOGGED"
+ setIt LoggedInUser "$WHO_LOGGED"
+
+ logIt "Starting caffeinate, to keep the computer awake."
+ caffeinate -dimsuw "$MY_PID" &
+
+ logIt "Logging status of Jamf Pro, the BootStrap Token, and existing Secure Token(s)."
+ logIt "$C_JAMF version: $( "$C_JAMF" version )"
+ logTokenStatus
+
+ logIt "Enabling HostInfo on login screen, and setting the login screen to username/password fields over list of users."
+ defaults write "$LOGIN_PLIST" AdminHostInfo -string HostName
+ defaults write "$LOGIN_PLIST" SHOWFULLNAME -bool true
+
+ updateUser "Enrollment in $JAMF_SERVER started..." "Loading Configuration..." start
+
+ logIt "Checking for configuration file:\n$( ls "/Library/Managed Preferences" )"
+
+ logIt "Loading configuration:\n$( defaults read "$DEFAULTS_FILE" )"
+
+ TEMP_ADMIN="${"$( defaultRead tempAdmin )":-"setup_admin"}"
+ setIt tempAdmin "$TEMP_ADMIN"
+ # Temporary admin account for managing Bootstrap and Secure Tokens, and save it so it can be deleted later.
+ LAPS_ADMIN="${"$( defaultRead lapsAdmin )":-"laps_admin"}"
+ setIt lapsAdmin "$TEMP_ADMIN"
+ # The admin account the support staff use after looking up the LAPS password.
+ # When using "profiles renew -type enrollment", the Jamf Pro management username must be logged in,
+ # therefore we can detect a PreStage re-enrollment when this account is logged in.
+
+ TEMP_NAME="${"$( defaultRead tempName )":-"Setup Admin"}"
+ LAPS_NAME="${"$( defaultRead lapsName )":-"LAPS Admin"}"
+ logIt "Accounts to set up:
+ Temp Admin: $TEMP_ADMIN - $TEMP_NAME
+ LAPS Admin: $LAPS_ADMIN - $LAPS_NAME"
+ if [ "$5" = "" ]; then
+  TEMP_PASS="setup"
+ else
+  TEMP_PASS="$( echo "$5" | base64 -d )"
+ fi
+ if [ "$6" = "" ]; then
+  LAPS_PASS="$TEMP_PASS"
+ else
+  LAPS_PASS="$( echo "$6" | base64 -d )"
+ fi
+ # Used by createAdmin for defining the real names and default (initial) passwords
+
+ if [ "$7" = "" ] || [ "$8" = "" ]; then
+  logAndExit 4 "API details are required for access to the \$JAMF_ADMIN password, the following was supplied:\nAPI ID: $7\nAPI Secret: $8"
+ else
+  API_ID="$( echo "$7" | base64 -d )"
+  API_SECRET="$( echo "$8" | base64 -d )"
+ fi
+ # These are used to check the $JAMF_ADMIN password and are required.
+
+ EMAIL_PASS="${9:-""}"
+ setIt emailPass "$EMAIL_PASS"
+ # Used for sending authenticated email. Since we may have to store this, we will leave it encoded until needed.
+
+ if [ "$10" = "" ]; then
+  GITHUB_AUTH=""
+ else
+  GITHUB_AUTH="GITHUBAPI=\"$10\""
+ fi
+ # Used with Installomator to help manage downloads from Github
+
+ # For security, the above 5 settings are not available via config profile, and must be base64 encoded.
+ # $5 - password for temp admin
+ # $6 - initial password for LAPS admin
+ # $7 - API ID
+ # $8 - API Secret
+ # $9 - authenticated email password (this is decoded when used, unlike the others being decoded when read)
+ # $10 - Github API Authentication Token for Installomator to use.
+
+ NETWORK_CHECK="${"$( defaultRead requireNetwork )":-"off"}"
+ # Must be either wired, wireless, or off.
+ #   - wired means a wired connection is required, and if not detected a notice will appear that will stop the computer from being used,
+ #       until a wired network connection is available. This is the default and recommended option, due to connection reliability.
+ #   - wireless means a wifi connection is acceptable, and a warning dialog will appear when not on a wired network connection.
+ #   - off means the network connection type is not checked at all. This is the default in the event of a typo.
+ WIRELESS_WARNED=false
+
+ logIt "Network checking is: $NETWORK_CHECK"
+
+ SYSTEM_TIME_ZONE="${"$( defaultRead systemTimeZone )":-"$( systemsetup -gettimezone | awk '{print $NF}' )"}"
+ SYSTEM_TIME_SERVER="${"$( defaultRead systemTimeServer )":-"$( systemsetup -getnetworktimeserver | awk '{print $NF}' )"}"
+ logIt "Time Syncronisation settings are:\nZone: $SYSTEM_TIME_ZONE\nServer: $SYSTEM_TIME_SERVER"
+
+ POLICY_INSTALLOMATOR="${"$( defaultRead policyInstallomator )":-"installInstallomator"}"
+ POLICY_BIND="${"$( defaultRead policyADBind )":-"adBind"}"
+ POLICY_UNBIND="${"$( defaultRead policyADUnbind )":-"adUnbind"}"
+ POLICY_INITIAL_FILES="${"$( defaultRead policyInitialFiles )":-"installInitialFiles"}"
+ POLICY_SET_COMPUTER_NAME="${"$( defaultRead policyComputerName )":-"fixComputerName"}"
+ POLICY_JAMF_PASSWORD_CYCLER="${"$( defaultRead policyCycleManagement )":-"cyclePassword"}"
+ logIt "Policies:\nInstallomator: $POLICY_INSTALLOMATOR\nLogin Service (Active Directory) Binding: $POLICY_BIND\nLogin Service (Active Directory) Unbinding: $POLICY_UNBIND\nInstall of initial files (such as dialog icon and admin picture): $POLICY_INITIAL_FILES\nSetting the computer name: $POLICY_SET_COMPUTER_NAME\nForce JAMF managed account to cycle it's password: $POLICY_JAMF_PASSWORD_CYCLER"
+
+ updateUser "Enrollment in $JAMF_SERVER started..." "Checking network connection."
+ networkRoute
+ updateUser "Starting initial installs..."
+
+ DEPLOYMENT_ARRAY=(
+  "Synching the Time to Zone $SYSTEM_TIME_ZONE via $SYSTEM_TIME_SERVER\tcommand\tsystemsetup -settimezone '$SYSTEM_TIME_ZONE' 2>/dev/null ; sleep 5 ; systemsetup -setnetworktimeserver $SYSTEM_TIME_SERVER 2>/dev/null ; sleep 5 ; sntp -Ss $SYSTEM_TIME_SERVER 2>/dev/null\t\t"
+  "Installing Rosetta 2 for Apple Silicon Mac using softwareupdate\tcommand\tsoftwareupdate --install-rosetta --agree-to-license 2>/dev/null\tarm64\t"
+  "Installing Installomator from Github to help with installing\tpolicy\t$POLICY_INSTALLOMATOR\t\t$C_INSTALL"
+  "Installing mkuser from Github using Installomator\tinstall\tmkuser\t\t$C_MKUSER"
+  "Unbinding from Active Directory\tpolicy\t$POLICY_UNBIND\t\t" # or "Unbinding from Active Directory\tcommand\tdsconfigad -leave -force"
+  "Installing Initial Files from $JAMF_SERVER\tpolicy\t$POLICY_INITIAL_FILES\t\t"
+  "Installing Dialog from Github using Installomator\tinstall\tdialog\t\t$C_DIALOG"
+ )
+
+ deployLoop 20
+ # Setting the Time Zone and the syncing the time should always be performed first, The above is the New Zealand timezone.
+ #    To find your time zone use 'systemsetup -listtimezones', to list all time zones, or 'systemsetup -gettimezone' to see your current time zone.
+ #    A new Mac will probably have one of Apples time server configured (i.e. time.apple.com), which should be acceptible, but can be changed with 'systemsetup -setnetworktimeserver "server.name"'.
+ # Rosetta 2 should be an automatic choice, incase of installing something that is not yet fully Apple Silicon available.
+ # Installomator is very useful for installing other apps and packages.
+ #    This requires a policy to install it before any attempt to use it.
+ # mkuser is an extremely useful tool for creating accounts.
+ # Unbinding from Active Directory, just in case, I recommend keeping this in Jamf Pro as a policy so it can be scoped, we could force it,
+ #    but every admin will have their preferred method for managing this. We do this to avoid issues with creating/managing the admin accounts.
+ #    I have included in a comment above, a version of unbinding without a jamf policy.
+ # swiftDialog is a useful scriptable dialog creation/management tool, great for providing feedback to the user or asking them questions.
+ # InitialFiles is simply one method of installing any basic files on the computer (such as a user picture image(s) for the admin accounts).
+
+ # Checking the network again
+ networkRoute
+
+ # Using the who command result to confirm enrollment method
+ SECURE_ADMIN=""
+ SECURE_PASS=""
+ # Used for account creation process below, which is intentionally empty
+ #   for the first account created, but may require collection from user.
+ logIt "What kind of enrollment is this? Checking $WHO_LOGGED"
+ # Used of $JAMF_ADMIN required, so we grab it's details first.
+ getJamfAccount
+ case "$WHO_LOGGED" in
+  _mbsetupuser)
+  # A DEP/PreStage enrollment will always result in the who command identifying the _mbsetupuser,
+  # since the process starts while the setup screens are still being processed.
+   logIt "PreStage Enrollment detected"
+   updateUser "PreStage Enrollment detected, managing Administrative accounts..."
+   logTokenStatus
+   # checking for the existance of the LAPS Admin (PreStage Enrollment MDM account)
+   if [ -e "/Users/$LAPS_ADMIN" ] && dscl . -authonly "$LAPS_ADMIN" "$LAPS_PASS" > /dev/null 2>&1 ; then
+    logIt "$LAPS_ADMIN exists, enabling Secure Token (just in case)"
+    sysadminctl -secureTokenOn "$LAPS_ADMIN" -password "$LAPS_PASS" -adminUser "$LAPS_ADMIN" -adminPassword "$LAPS_PASS" >> "$LOG_FILE" 2>&1
+    logTokenStatus
+    # create $TEMP_ADMIN, add Secure Tokens for $LAPS_ADMIN and $JAMF_ADMIN.
+    createAdmin "$TEMP_ADMIN" "$TEMP_PASS" "$LAPS_ADMIN" "$LAPS_PASS" skipchecks
+    logTokenStatus
+    sysadminctl -deleteUser "$LAPS_ADMIN" -adminUser "$TEMP_ADMIN" -adminPassword "$TEMP_PASS" >> "$LOG_FILE" 2>&1
+    logTokenStatus
+   else
+    # create $TEMP_ADMIN, add Secure Tokens for $LAPS_ADMIN and $JAMF_ADMIN.
+    createAdmin "$TEMP_ADMIN" "$TEMP_PASS"
+   fi
+   # Add Secure Tokens for $LAPS_ADMIN and $JAMF_ADMIN.
+   SECURE_ADMIN="$TEMP_ADMIN"
+   SECURE_PASS="$TEMP_PASS"
+   sleep 2
+   logTokenStatus
+   if [ "$( fdesetup list | grep -c "$TEMP_ADMIN" )" -lt 1 ]; then
+    logAndExit 5 "$TEMP_ADMIN failed to get a Secure Token, how did this happen?"
+    # fail and exit, this should not happen to the first created account.
+   fi
+
+   # $LAPS_ADMIN does not get created as a hidden account so we will remove and recreate it,
+   #   this account should already be there without a secure token
+   #   createAdmin will detect the existing profile and remove the account.
+
+   createAdmin "$LAPS_ADMIN" "$LAPS_PASS" "$SECURE_ADMIN" "$SECURE_PASS"
+   sleep 2
+   logTokenStatus
+   if [ "$( fdesetup list | grep -c "$LAPS_ADMIN" )" -lt 1 ]; then
+    logAndExit 6 "$LAPS_ADMIN failed to get a Secure Token, how did this happen?"
+    # fail and exit, this should not happen to the first created account.
+   fi
+
+   # $JAMF_ADMIN details should have already been collected;
+   #   - For Jamf Pro 11.1.0 and older, this account should already be there without a secure token.
+   #   For Jamf Pro 11.1.1 and newer, this account will still require being added.
+   if [ -e "/var/$JAMF_ADMIN" ] || dscl . -authonly "$JAMF_ADMIN" "$JAMF_PASS" > /dev/null 2>&1 ; then
+    logIt "$JAMF_ADMIN exists, enabling Secure Token"
+    sysadminctl -secureTokenOn "$JAMF_ADMIN" -password "$JAMF_PASS" -adminUser "$SECURE_ADMIN" -adminPassword "$SECURE_PASS" >> "$LOG_FILE" 2>&1
+   else
+    logIt "$JAMF_ADMIN account not added yet (Jamf Pro version 11.1.1+), creating the account."
+    createAdmin "$JAMF_ADMIN" "$JAMF_PASS" "$SECURE_ADMIN" "$SECURE_PASS"
+   fi
+   sleep 2
+   logTokenStatus
+   if [ "$( fdesetup list | grep -c "$JAMF_ADMIN" )" -lt 1 ]; then
+    logAndExit 7 "Failed to enable the Secure Token for $JAMF_ADMIN. This should not have happened."
+    # fail and exit, this should not happen to the first created account.
+   fi
+
+   # Only restart on a prestage login in order for the computer to log in.
+  ;;
+  *)
+   checkAdmin() {
+    if dscl . -authonly "$1" "$2" > /dev/null 2>&1 && [ "$( fdesetup list | grep -c "$1") " -gt 0 ]; then
+     SECURE_ADMIN="$1"
+     SECURE_PASS="$2"
+     if [ "$( dscl . -read /Groups/admin GroupMembership | cut -d " " -f 2- | grep -c "$1" )" -lt 1 ]; then
+      dseditgroup -o edit -a "$1" -t user admin
+      # we need this account to be an admin.
+     fi
+    fi
+   }
+   logIt "(Re-)Enrollment requires login details of a Secure Token enabled account, detected."
+   updateUser "Username: $WHO_LOGGED logged in, attempting to manage Administrative accounts..."
+   logIt "Trying $JAMF_ADMIN"
+   checkAdmin "$JAMF_ADMIN" "$JAMF_PASS"
+   if [ -z "$SECURE_ADMIN" ]; then
+    sleep 1
+    logIt "$JAMF_ADMIN failed, trying $TEMP_ADMIN"
+    checkAdmin "$TEMP_ADMIN" "$TEMP_PASS"
+    if [ -z "$SECURE_ADMIN" ]; then
+     sleep 1
+     logIt "$TEMP_ADMIN failed, trying $LAPS_ADMIN"
+     checkAdmin "$LAPS_ADMIN" "$LAPS_PASS"
+    fi
+   fi
+
+   if [ -z "$SECURE_ADMIN" ]; then
+    logIt "Unable to manage Administrator accounts, attempting to ask logged in user."
+    networkRoute
+    updateUser "Unable to manage Administrator accounts, please provide login details of a volume owner..."
+    # ask for password of someone with a secure token, and promote to admin
+    # fdesetup list | cut -d ',' -f 1 | tr '\n' ' '
+    # dseditgroup -o edit -a $SECURE_ADMIN -t user admin
+    # This is where it gets tricky, as some methods of enrollment are not supposed to interact with the user.
+    # A profiles renew -type enrollment is less likely to allow this than a manual enrollment, so some testing will be required.
+
+    TRY_AGAIN=""
+    DEMOTE_ADMIN=""
+    while [ -z "$SECURE_ADMIN" ]; do
+     LOGIN_MESSAGE="**The login of a Volume Owner (a Secure Token enabled user) is required to complete this enrollment.**\n\n**Please login as a Volume Owner below.**  \n**Current Volume Owners are:** $( fdesetup list | cut -d ',' -f 1 | tr '\n' ' ' )  \n$TRY_AGAIN\n\n---\n\nNow is a good time to check the computer information is correct, and the following superuser (sudo) terminal commands can be used to manage Volume Owners (to fix Secure Tokens), in the event the login details for all of the above usernames are unknown:\n\n    fdesetup list  \n    sysadminctl -secureTokenOn <username> -password - -adminUser <admin> -adminPassword -  \n- _fdesetup_ lists all accounts with Secure Tokens.  \n- _sysadminctl_ creates the Secure Token after asking for the passwords of the _admin_ and _username_ accounts.  \n    - The _admin_ account must have a Secure Token."
+     if [ -z "$TRY_AGAIN" ]; then
+      LOGIN_DETAILS="$( "$C_DIALOG" --title "Enrollment requires login to preceed..." --icon "$DIALOG_ICON" --message "$LOGIN_MESSAGE" --messagefont size=16 --textfield "Username",required,prompt="Please enter a Volume Owner" --textfield "Password",secure,required --json --big 2>>"$LOG_FILE" )"
+     else
+      LOGIN_DETAILS="$( "$C_DIALOG" --title "Enrollment requires login to preceed..." --icon warning --overlayicon "$DIALOG_ICON" --message "$LOGIN_MESSAGE" --messagefont size=16 --textfield "Username",required,prompt="Please enter a Volume Owner" --textfield "Password",secure,required --json --big 2>>"$LOG_FILE" )"
+     fi
+     A_ADMIN="$( readJSON "$LOGIN_DETAILS" "Username" )"
+     A_PASS="$( readJSON "$LOGIN_DETAILS" "Password" )"
+     logIt "User is attempting to log into: $A_ADMIN"
+     if dscl . -authonly "$A_ADMIN" "$A_PASS" > /dev/null 2>&1 && [ "$( fdesetup list | grep -c "$A_ADMIN" )" -gt 0 ]; then
+      logIt "Login successful, and $A_ADMIN has a Secure Token"
+      SECURE_ADMIN="$A_ADMIN"
+      SECURE_PASS="$A_PASS"
+      if [ "$( dscl . -read /Groups/admin GroupMembership | cut -d " " -f 2- | grep -c "$A_ADMIN" )" -lt 1 ]; then
+       # only give admin if we need to and track it for removal later
+       LogIt "Admin access is required. Giving $A_ADMIN temporary admin access."
+       dseditgroup -o edit -a "$A_ADMIN" -t user admin >> "$LOG_FILE" 2>&1
+       DEMOTE_ADMIN="$A_ADMIN"
+       # we need this account to be an admin.
+      fi
+     elif [ "$( fdesetup list | grep -c "$A_ADMIN" )" -gt 0 ]; then
+      logIt "Login to $A_ADMIN failed, asking the user to log in again..."
+      TRY_AGAIN="<br>**Password for $A_ADMIN was incorrect.**"
+     else
+      logIt "Secure Token missing for $A_ADMIN, they are not a Volume Owner, asking the user to log in again..."
+      TRY_AGAIN="<br>**$A_ADMIN is not a Volume Owner.**"
+     fi
+    done
+   fi
+   networkRoute
+   updateUser "$SECURE_ADMIN details provided, managing Administrative accounts..."
+
+   logIt "Configuring Admin Accounts..."
+   for THE_ADMIN in $TEMP_ADMIN $LAPS_ADMIN $JAMF_ADMIN ; do
+    logIt "Managing: $THE_ADMIN"
+
+    case "$THE_ADMIN" in
+     $JAMF_ADMIN)
+      A_PASS="$JAMF_PASS"
+     ;;
+     $LAPS_ADMIN)
+      A_PASS="$LAPS_PASS"
+     ;;
+     $TEMP_ADMIN)
+      A_PASS="$TEMP_PASS"
+     ;;
+    esac
+
+    if [ "$( dscl . read "/Users/$THE_ADMIN" 2>&1 | grep -c eDSRecordNotFound )" -gt 0 ]; then
+     logIt "$THE_ADMIN doesn't exist, creating..."
+     createAdmin "$THE_ADMIN" "$A_PASS" "$SECURE_ADMIN" "$SECURE_PASS"
+    fi
+    if [ "$( dscl . -read /Groups/admin GroupMembership | cut -d " " -f 2- | grep -c "$THE_ADMIN" )" -lt 1 ]; then
+     logIt "$THE_ADMIN is not an admin, promoting them to admin..."
+     dseditgroup -o edit -a "$THE_ADMIN" -t user admin >> "$LOG_FILE" 2>&1
+     # just making sure our admin accounts have admin access.
+    fi
+
+    if ! dscl . -authonly "$THE_ADMIN" "$A_PASS" > /dev/null 2>&1 ; then
+     logIt "$THE_ADMIN login failed, resetting the password to the correct password"
+     sysadminctl -resetPasswordFor "$THE_ADMIN" -newPassword "$A_PASS" -adminUser "$SECURE_ADMIN" -adminPassword "$SECURE_PASS" >> "$LOG_FILE" 2>&1
+     if [ "$THE_ADMIN" = "$SECURE_ADMIN" ]; then
+      SECURE_PASS="$A_PASS"
+     fi
+    fi
+    if [ "$( fdesetup list | grep -c "$THE_ADMIN" )" -lt 1 ]; then
+     logIt "$THE_ADMIN does not have a Secure Token, creating Secure Token..."
+     sysadminctl -secureTokenOn "$THE_ADMIN" -password "$A_PASS" -adminUser "$SECURE_ADMIN" -adminPassword "$SECURE_PASS" >> "$LOG_FILE" 2>&1
+    fi
+   done
+   if [[ "$SECURE_ADMIN" != ($TEMP_ADMIN|$LAPS_ADMIN|$JAMF_ADMIN) ]] && [ "$SECURE_ADMIN" = "$DEMOTE_ADMIN" ]; then
+    # We only want to demote an account we promoted.
+    logIt "Demoting $SECURE_ADMIN, as it is not one of our managed Admin accounts (and we had promoted it)..."
+    dseditgroup -o edit -d "$SECURE_ADMIN" -t user admin >> "$LOG_FILE" 2>&1
+   fi
+   SECURE_ADMIN="$TEMP_ADMIN"
+   SECURE_PASS="$TEMP_PASS"
+   # Inserting some error checking here
+   if ! dscl . -authonly "$TEMP_ADMIN" "$TEMP_PASS" > /dev/null 2>&1 ; then
+    logAndExit 8 "Unable to verify $TEMP_ADMIN login details"
+   fi
+   sleep 1
+   if ! dscl . -authonly "$JAMF_ADMIN" "$JAMF_PASS" > /dev/null 2>&1 ; then
+    logAndExit 9 "Unable to verify $JAMF_ADMIN login details"
+   fi
+   sleep 1
+   if ! dscl . -authonly "$LAPS_ADMIN" "$LAPS_PASS" > /dev/null 2>&1 ; then
+    logAndExit 10 "Unable to verify $LAPS_ADMIN login details"
+   fi
+   networkRoute
+   updateUser "Administrator accounts created, managing Device Management access..."
+   # BootStrap Token installation using expect with the profiles command.
+   # Using the -c option to allow passing of variables for account name and password.
+   # Broken down in a variable for better viewing on the expect script, so that it is not a one liner.
+   # mkuser will escrow the BootStrap Token during a PreStage enrollment, requring this for all other enrollment types.
+   logTokenStatus
+   logIt "Escrowing BootStrap Token - required for manual enrolments and re-enrolments."
+   EXPECT_SCRIPT="expect -c \""
+   EXPECT_SCRIPT+="spawn profiles install -type bootstraptoken ;"
+   EXPECT_SCRIPT+=" expect \\\"Enter the admin user name:\\\" ;"
+   EXPECT_SCRIPT+=" send \\\"$SECURE_ADMIN\\r\\\" ;"
+   EXPECT_SCRIPT+=" expect \\\"Enter the password for user '$SECURE_ADMIN':\\\" ;"
+   EXPECT_SCRIPT+=" send \\\"$SECURE_PASS\\r\\\" ;"
+   EXPECT_SCRIPT+=" expect \\\"profiles: Bootstrap Token escrowed\\\"\""
+   eval "$EXPECT_SCRIPT" >> "$LOG_FILE" 2>&1
+   logTokenStatus
+  ;;
+ esac
+
+ DEPLOYMENT_ARRAY=(
+  "Updating Device Management with current progress...\tcommand\t$C_JAMF recon -randomDelaySeconds $MYSLEEP\t\t"
+  "Setting Computer Name\tpolicy\t$POLICY_SET_COMPUTER_NAME\t\t"
+  "Updating Device Management with current progress...\tcommand\t$C_JAMF recon -randomDelaySeconds $MYSLEEP\t\t"
+  "Binding to Active Directory\tpolicy\t$POLICY_BIND\t\t"
+  "Updating Device Management with current progress...\tcommand\t$C_JAMF recon -randomDelaySeconds $MYSLEEP\t\t"
+ )
+ deployLoop 30
+ # "Updating Device Management with current progress...\tcommand\t$C_JAMF recon"
+ #    Time to update Jamf Pro with where we are at, by performing a recon.
+ # "Setting Computer Name\tpolicy\tFixName"
+ # "Installing macosLAPS from Github using Installomator\tinstall\tmacoslaps"
+ #    Using macOSLAPS to cycle the LAPS_ADMIN password, this should be configured via a config profile.
+ #    Placed here to create some time between setting the computer name and binding.
+ # "Binding to Active Directory\tpolicy\tbind"
+ #    Next it is time to set the computer name if there is something automated available, followed by re-binding the computer to Active Directory.
+ #    I have a script that polls a google spreadsheet throught a Google Apps Script for the computer names, based on the computers serial number.
+ # "Updating Device Management with current progress...\tcommand\t$C_JAMF recon"
+ #    Using a recon to create space between the bind and password cycling/
+ # "Randomising Device Management Password\tpolicy\tcyclePassword"
+ #    Getting Jamf Pro to cycle it's own password for $JAMF_ADMIN. This invalidates the $JAMF_PASS, but can be re-collected.
+ # "Randomising Administrative Password\tcommand\t/usr/local/laps/macOSLAPS -firstPass $TEMP_PASS"
+ #    Using macoslaps to randomise the LAPS_ADMIN password. This invalidates the $TEMP_PASS.
+ # "Updating Device Management with current progress...\tcommand\t$C_JAMF recon"
+ #    One last recon (I have Jamf Pro configured with an extension attribute that gathers a copy of the LAPS expiry date).
+
+ # Time to had off processing to handle the rest of the installs
+
+ ditto "$0" "$STARTUPFILE"
+ APP_LIST="${"$( defaultRead appLIST )":-""}"
+ if [ "$APP_LIST" != "" ] && [[ "$APP_LIST" != (LOG|Log|log) ]] && [ -e "$APP_LIST" ]; then
+  rm -f "$APP_LIST"
+  touch "$APP_LIST"
+ fi
+ defaults write "/Library/LaunchDaemons/$DEFAULTS_NAME.plist" Label "$DEFAULTS_NAME"
+ defaults write "/Library/LaunchDaemons/$DEFAULTS_NAME.plist" RunAtLoad -bool TRUE
+ updateUser "${"$( defaultRead finalTextOne )":-""}" "${"$( defaultRead finalTextTwo )":-""}" end
+ if [ "$WHO_LOGGED" = "_mbsetupuser" ]; then
+  logIt "Setting up LaunchDaemons script & plist for for PreStage enrollment to continue."
+  defaults write "/Library/LaunchDaemons/$DEFAULTS_NAME.plist" ProgramArguments -array "$STARTUPFILE" startup "$PREF_DOMAIN"
+  shutdown -r +1 >> "$LOG_FILE" 2>&1 &
+ else
+  defaults write "/Library/LaunchDaemons/$DEFAULTS_NAME.plist" ProgramArguments -array "$STARTUPFILE" cleanup "$PREF_DOMAIN"
+  StartNextStage=false
+  logIt "Manual Enrollment Complete."
+  MANUAL_CONTINUE="${"$( defaultRead manualContinue )":-"ask"}"
+  CONTINUE_TIMER="${"$( defaultRead continueTimer )":-"0"}"
+  case $MANUAL_CONTINUE in
+   skip)
+    # do nothing except log we are doing nothing
+    logIt "Configuration set to skip opening Self Service, exiting"
+    updateUser "Manual Enrollment Complete - Skipping next stage."
+   ;;
+   always)
+    # this should ask, based on a config profile setting, something like always, ask, and skip.
+    logIt "Configuration set to always, starting Self Service"
+    updateUser "Manual Enrollment Complete - Starting next stage."
+    StartNextStage=true
+   ;;
+   *)
+    # ask (since that is the default)
+    logIt "Configuration set to ask (or not set) user if we are to continue to Self Service, asking user"
+    updateUser "Manual Enrollment Complete - Shall we continue?"
+     if "$C_DIALOG" --title "Continue setup?" --message "Enrollment Complete, shall we continue set up?\n\nContinuing in..." --icon "$DIALOG_ICON" --button1text "Continue" --button2text "Skip" --mini --timer "$CONTINUE_TIMER" >> "$LOG_FILE" 2>&1 ; then
+      logIt "User selected Continue, starting Self Service"
+      updateUser "Continue selected, starting next stage."
+      StartNextStage=true
+     elif [ $? = 4 ]; then
+      logIt "Continue dialog timed out, starting Self Service anyway"
+      updateUser "Continue assumed (selection timed out), starting next stage."
+      StartNextStage=true
+     else
+      logIt "User selected Skip, finishing enrollment."
+      updateUser "Skip selected, finalising enrollment."
+     fi
+   ;;
+  esac
+  sleep 2
+  if ${$( defaultReadBool tempKeep ):-false}; then
+   logIt "Removing $TEMP_ADMIN as no longer required."
+   getJamfAccount
+   sysadminctl -deleteUser "$TEMP_ADMIN" -adminUser "$JAMF_ADMIN" -adminPassword "$JAMF_PASS" >> "$LOG_FILE" 2>&1
+   sleep 10
+   "$C_JAMF" policy -event "$POLICY_JAMF_PASSWORD_CYCLER" >> "$LOG_FILE" 2>&1
+  fi
+  if $StartNextStage ; then
+   setIt OnBoarding "$( date "+%s" )"
+   keepSSGoing
+  else
+   setIt OnBoarding "Skipped"
+   "$STARTUPFILE" success "$PREF_DOMAIN" "$EMAIL_PASS"
+  fi
+ fi
+else
+ TEMP_ADMIN="$( defaultRead tempAdmin )"
+ case "$1" in
+  startup)
+   setIt OnBoarding "$( date "+%s" )"
+   while [ -z "$( pgrep "Finder" )" ]; do
+    sleep $MYSLEEP
+   done
+   sleep $MYSLEEP
+   networkRoute
+   defaults delete /Library/Preferences/com.apple.loginwindow.plist autoLoginUser
+   defaults write "/Library/LaunchDaemons/$DEFAULTS_NAME.plist" ProgramArguments -array "$STARTUPFILE" cleanup "$PREF_DOMAIN"
+   if [ "$( who | grep console | wc -l )" -gt 1 ]; then
+    WHO_LOGGED="$( who | grep -v mbsetupuser | grep -m1 console | cut -d " " -f 1 )"
+   else
+    WHO_LOGGED="$( who | grep -m1 console | cut -d " " -f 1 )"
+   fi
+   keepSSGoing
+  ;;
+  success)
+   ONBOARDED="$( readIt OnBoarding )"
+   EMAIL_PASS="$( readIt emailPass )"
+   EMAIL_JAMF_LOG=${$( defaultReadBool emailJamfLog ):-false}
+   APP_LIST="${"$( defaultRead appLIST )":-""}"
+   EMAIL_LIST=""
+   if [ "$APP_LIST" != "" ] && [[ "$APP_LIST" != (LOG|Log|log) ]] && [ -e "$APP_LIST" ] && [ "$ONBOARDED" != "Skipped" ]; then
+
+    textpart() {
+     echo "$1" | cut -f $2
+    }
+
+    STDICON="${"$( defaultRead dialogIcon )":-"caution"}"
+    LISTCOUNT=0
+    LISTREQUIRED=()
+    REQUIREDCOUNT=0
+    LISTINSTALLED=0
+    COMMANDFILE="/tmp/OnBoarding-$$.dialog"
+    ICONCACHE="/Library/Caches/$DEFAULTS_NAME"
+    TMP_ICON="$ICONCACHE/download.png"
+    mkdir -p "$ICONCACHE"
+
+    for ITEM in "${(@f)"$(<"$APP_LIST")"}" ; do
+     NAME="$( textpart "$ITEM" 2 )"
+     MYICON="$( textpart "$ITEM" 4 )"
+     if [ "$MYICON" = "" ]; then
+      MYICON="$STDICON"
+     else
+      curl -s -o "$TMP_ICON" "$( textpart "$ITEM" 4 )"
+      sleep 0.1
+      MYICON="$ICONCACHE/$NAME.png"
+      sips -s format png "$TMP_ICON" --out "$MYICON"
+      sleep 0.1
+      rm -f "$TMP_ICON"
+     fi
+     LISTNAMES+=( "--listitem" )
+     ((LISTCOUNT++))
+     if [ "$( textpart "$ITEM" 5 )" = "Required" ]; then
+      LISTREQUIRED+=( "$NAME" )
+      LISTNAMES+=( "$NAME",icon="$MYICON",subtitle="Required application" )
+      ((REQUIREDCOUNT++))
+     else
+      LISTNAMES+=( "$NAME",icon="$MYICON",subtitle="Self Service application" )
+     fi
+     sleep 0.1
+    done
+    LISTNAMES+=( "--listitem" )
+    RECON="Perform Inventory Update"
+    LISTNAMES+=( "$RECON" )
+
+    THEICON="$STDICON"
+
+    STARTED=$( date "+%s" )
+    WAITTIME=$(($LISTCOUNT*$PERAPP*60))
+    # Number of list items time 10 (minutes) * 60 (seconds)
+    ENDAFTER=$(($STARTED+$WAITTIME))
+    INFOBOX="**macOS $( sw_vers -productversion )** on  <br>$( scutil --get ComputerName )  <br><br>"
+    INFOBOX+="**Started:**  <br>$( date -jr "$STARTED" "+%d/%m/%Y %H:%M" )  <br><br>"
+    INFOBOX+="**Estimated Finish:**  <br>$( date -jr "$ENDAFTER" "+%d/%m/%Y %H:%M" )  <br><br>"
+    INFOBOX+="**Apps to Install:** $LISTCOUNT  <br>**Required:** $REQUIREDCOUNT  <br><br>"
+
+    "$C_DIALOG" --title "Installation Status" \
+     --message "Attempting to confirm the installation of the following apps..." \
+     --commandfile "$COMMANDFILE" \
+     --moveable \
+     --ontop \
+     --button1text "Done" \
+     --button1disabled \
+     --height 75% \
+     --width 768 \
+     --position bottomleft \
+     --progress $LISTCOUNT \
+     --infobox "$INFOBOX**Confirmed Installed:**  <br>Required - 0  <br>Total - 0" \
+     --infotext "${"$( defaultRead finalTextOne )":-""}\n${"$( defaultRead finalTextTwo )":-""}" \
+     --titlefont size=18 \
+     --messagefont size=14 \
+     --quitkey k \
+     --icon "$THEICON" \
+     --overlayicon "$STDICON" \
+     --liststyle compact \
+     ${LISTNAMES[@]} &
+    DIALOGPROCESS=$!
+
+    sleep 2
+
+    dialogupdate() {
+     echo "$1" >> "$COMMANDFILE"
+     sleep 0.1
+    }
+    DONE_DISABLED="disabled"
+    LAST_UPDATE=0
+    REQCOMPLETED=0
+
+    while [ ! $LISTINSTALLED = $LISTCOUNT ] && [ $( date "+%s" ) -lt $ENDAFTER ] && [ "$DONE_DISABLED" != "exit" ] ; do
+     SKIP_UPDATE=true
+     for ITEM in "${(@f)"$(<"$APP_LIST")"}" ; do
+      NAME="$( textpart "$ITEM" 2 )"
+      MYPATH="$( textpart "$ITEM" 3 )"
+      MYICON="$( textpart "$ITEM" 4 )"
+      if [[ "$COMPLETED" = *"$NAME"* ]]; then
+       continue
+      fi
+      sleep 0.5
+      if [ -n "$MYICON" ] && [ ! "$THEICON" = "$MYICON" ]; then
+       THEICON="$MYICON"
+       dialogupdate "icon: $MYICON"
+      fi
+      dialogupdate "progresstext: Checking $NAME..."
+      dialogupdate "listitem: title: $NAME, status: wait, statustext: Checking..."
+      if [ -e "$MYPATH" ]; then
+       TEAMID="$( textpart "$ITEM" 1 )"
+       if [ "$TEAMID" = "" ]; then
+        CHECKAPP=""
+        CHECKSTATUS=1
+       else
+        CHECKAPP="$( spctl -a -vv "$MYPATH" 2>&1 )"
+        CHECKSTATUS="$?"
+       fi
+       INSTALLSTATUS="Installed"
+       if [ $CHECKSTATUS = 0 ]; then
+        if [[ "$CHECKAPP" = *"($TEAMID)"* ]]; then
+         INSTALLSTATUS+=" and Verified"
+        elif [[ "$CHECKAPP" = *"Mac App Store"* ]]; then
+         INSTALLSTATUS+=" via Mac App Store"
+        else
+         INSSTALLEDTEAMID="$( echo "$CHECKAPP" | awk '/origin=/ {print $NF }' | tr -d '()' )"
+         INSTALLSTATUS+=" but Developer ID ($TEAMID) didn't match installed ID ($INSSTALLEDTEAMID)"
+        fi
+       fi
+
+       if [[ ! "$COMPLETED" = *"$NAME"* ]]; then
+        case "$INSTALLSTATUS" in
+         Installed)
+          INSTALLSTATUS+=" but unable to verify Developer ID ($TEAMID)"
+          MYSUCCESS="error"
+         ;;
+         *" didn't match "*)
+          MYSUCCESS="fail"
+         ;;
+         *)
+          MYSUCCESS="success"
+         ;;
+        esac
+        dialogupdate "listitem: title: $NAME, status: $MYSUCCESS, statustext: $INSTALLSTATUS"
+        EMAIL_LIST+="$( date ) - $NAME - $INSTALLSTATUS.\n"
+        if [ -z "$COMPLETED" ]; then
+         COMPLETED=""
+        else
+         COMPLETED+=", "
+        fi
+        COMPLETED+="$NAME"
+        ((LISTINSTALLED++))
+        if [ "$DONE_DISABLED" = "disabled" ]; then
+         REQCOMPLETED=0
+         for REQITEM in $LISTREQUIRED ; do
+          if [[ "$COMPLETED" = *"$REQITEM"* ]]; then
+           ((REQCOMPLETED++))
+          fi
+          if [ $REQCOMPLETED -ge $REQUIREDCOUNT ]; then
+           logIt "All Required apps installed, enabling Done button."
+           dialogupdate "button1: enable"
+           DONE_DISABLED="enabled"
+          fi
+         done
+        fi
+        dialogupdate "progress: increment"
+       fi
+      else
+       INSTALLSTATUS="NOT Installed"
+       dialogupdate "listitem: title: $NAME, status: pending, statustext: Application not found."
+      fi
+      dialogupdate "infobox: $INFOBOX**Confirmed Installed:**  <br>**Required:** $REQCOMPLETED  <br>**Total:** $LISTINSTALLED"
+     sleep 0.5
+     done
+     if [ "$( date "+%s" )" -gt "$(($LAST_UPDATE+$PERAPP*60))" ]; then
+      dialogupdate "progresstext: Performing Inventory Update..."
+      dialogupdate "listitem: title: $RECON, status: wait, statustext: Performing Inventory Update..."
+      "$C_JAMF" recon -stopConsoleLogs -randomDelaySeconds $MYSLEEP
+      dialogupdate "listitem: title: $RECON, status: success, statustext: Last Updated:- $( date "+%H:%M" )"
+      LAST_UPDATE="$( date "+%s" )"
+      SKIP_UPDATE=false
+     else
+      dialogupdate "progresstext: Waiting $MYSLEEP seconds before going back through (or exiting)..."
+      sleep $MYSLEEP
+     fi
+     logIt "Progress: LISTCOUNT = $LISTCOUNT - LISTINSTALLED = $LISTINSTALLED\nCOMPLETED: $COMPLETED"
+     if [ "$DONE_DISABLED" = "enabled" ] && [ "$( pgrep "dialog" | grep "$DIALOGPROCESS" )" != "$DIALOGPROCESS" ]; then
+      logIt "Done clicked, exiting..."
+      DONE_DISABLED="exit"
+     fi
+    done
+
+    if $SKIP_UPDATE; then
+     dialogupdate "progresstext: Performing Inventory Update..."
+     dialogupdate "listitem: title: $RECON, status: wait, statustext: Performing Inventory Update..."
+     "$C_JAMF" recon -stopConsoleLogs -randomDelaySeconds $MYSLEEP
+     dialogupdate "listitem: title: $RECON, status: success, statustext: Last Updated:- $( date "+%H:%M" )"
+    fi
+
+    dialogupdate "progresstext: All Applications Installed, This window will close in $PERAPP minutes."
+    dialogupdate "progress: complete"
+
+    EMAIL_LIST+="$( date ) - Final Status: LISTCOUNT = $LISTCOUNT - LISTINSTALLED = $LISTINSTALLED\n"
+    if [ $LISTINSTALLED -lt $LISTCOUNT ]; then
+     if [ "$( date "+%s" )" -lt $ENDAFTER ]; then
+      WAITTIME=$(($( date "+%s" )-$STARTED))
+      EMAIL_LIST+="$( date ) - The following apps were not installed within the $(($WAITTIME/60)) minutes that was monitored.\n"
+     else
+      EMAIL_LIST+="$( date ) - The following apps were not installed within $(($WAITTIME/60)) minutes (We allowed $PERAPP minutes to wait for each app).\n"
+     fi
+     for ITEM in "${(@f)"$(<"$APP_LIST")"}" ; do
+      NAME="$( textpart "$ITEM" 2 )"
+      if [[ ! "$COMPLETED" = *"$NAME"* ]]; then
+       EMAIL_LIST+="$NAME$( if [[ "$LISTREQUIRED" = *"$NAME"* ]]; then echo " was required" ; fi )\n"
+      fi
+     done
+    fi
+    dialogupdate "button1: enable"
+
+    for i in {1..$(($PERAPP*60))}; do
+     sleep 1
+     if [ -z "$( ps -axj | grep Dialog | grep "$DIALOGPROCESS" )" ]; then
+      break
+     fi
+    done
+    logIt "Finished waiting for Mac App Store and Jamf App Installer applications.\n"
+    dialogupdate "quit:"
+    sleep 2
+    rm -f "$COMMANDFILE"
+
+   fi
+   logIt "All finished - starting email sequence."
+
+   if $EMAIL_JAMF_LOG ; then
+    logAndExit 1 "Finished Successfully, forcing Jamf to email log."
+   else
+    logAndExit 0 "Finished Successfully"
+   fi
+  ;;
+  cleanup)
+   setIt CleanUpStarted "$( date "+%s" )"
+   defaults delete "$SETTINGS_FILE" emailPass 2>/dev/null
+   if [ -z "$( pgrep "Finder" )" ]; then
+    logIt "This cleanup should on happen on startup, skipping this run."
+   else
+    if ${$( defaultReadBool tempKeep ):-false}; then
+     rm -rf "$STARTUPFILE" "/Library/LaunchDaemons/$DEFAULTS_NAME.plist"
+    else
+     "$C_JAMF" deleteAccount -username "$TEMP_ADMIN" -deleteHomeDirectory
+     sleep 10
+     rm -rf "/Users/$TEMP_ADMIN" "$STARTUPFILE" "/Library/LaunchDaemons/$DEFAULTS_NAME.plist"
+    fi
+   fi
+   "$C_JAMF" manage -stopConsoleLogs
+  ;;
+  *)
+   echo "This should not have happened"
+   exit 1
+  ;;
+ esac
+fi
