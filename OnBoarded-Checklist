@@ -1,0 +1,233 @@
+#!/bin/zsh
+
+LISTNAME="$4"
+FULLLIST="${5:-"$( defaults read /Library/Managed\ Preferences/*.enrollmentComplete.plist appLIST 2>/dev/null )"}"
+STDICON="$6"
+SUPTEAMID="$7"
+REQUIRED="$8"
+APPFULLPATH="$9"
+
+textpart() {
+ echo "$1" | /usr/bin/cut -s -f $2
+}
+
+buildfulllist() {
+ local COMPANY="$1"
+ local TEAMID="$2"
+ local ICON="$3"
+ local DISPLAYNAME=""
+ local MYPATH=""
+ for ITEM in $LIST ; do
+  DISPLAYNAME="$( if [ -n "$COMPANY" ]; then echo "$COMPANY "; fi )$( textpart "$ITEM" 1 )"
+  MYPATH="$( textpart "$ITEM" 2 )"
+  if [ -z "$MYPATH" ]; then
+   if [ "$COMPANY" = "Adobe" ]; then
+    MYPATH="$DISPLAYNAME/$DISPLAYNAME"
+   else
+    MYPATH="$DISPLAYNAME"
+   fi
+  fi
+  if [[ "$MYPATH" != "/"* ]]; then
+   MYPATH="/Applications/$MYPATH.app"
+  fi
+  MYICON="$( textpart "$ITEM" 3 )"
+  if [ "$MYICON" = "" ]; then
+   MYICON="$ICON"
+  fi
+  if [ "$MYICON" = "" ]; then
+   MYICON="$STDICON"
+  fi
+  THISAPP="$TEAMID\t$DISPLAYNAME\t$MYPATH\t$MYICON"
+  if [ "$( grep -c "$THISAPP" "$FULLLIST" )" -lt 1 ]; then
+   echo "$THISAPP\t$4" >> "$FULLLIST"
+  fi
+ done
+}
+
+buildAdobe() {
+ AD="Adobe"
+ ADY="$( date -j "+%Y" )"
+ LIST=(
+  "Acrobat\t$AD Acrobat DC/$AD Acrobat\thttps://appinstallers-packages.services.jamfcloud.com/icons/029.png"
+  "After Effects $ADY\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/5E8.png"
+  "Animate 2024\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/5EB.png"
+  "Audition $ADY\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/5E6.png"
+  "Bridge $ADY\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/5C5.png"
+  "Character Animator $ADY\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/5E9.png"
+  "Creative Cloud\t/Applications/Utilities/Adobe Creative Cloud/ACC/Creative Cloud.app\t"
+  "Dimension\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/08A.png"
+  "Dreamweaver 2021\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/2CE.png"
+  "Illustrator\t$AD Illustrator $ADY/$AD Illustrator\thttps://appinstallers-packages.services.jamfcloud.com/icons/5EC.png"
+  "InCopy $ADY\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/5EA.png"
+  "InDesign $ADY\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/5E5.png"
+  "Lightroom CC\t$AD Lightroom CC/$AD Lightroom\thttps://appinstallers-packages.services.jamfcloud.com/icons/08B.png"
+  "Lightroom Classic\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/027.png"
+  "Media Encoder $ADY\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/5E7.png"
+  "Photoshop $ADY\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/5C4.png"
+  "Premiere Pro $ADY\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/5E4.png"
+  "Premiere Rush\t$AD Premiere Rush 2.0/$AD Premiere Rush\thttps://appinstallers-packages.services.jamfcloud.com/icons/4D3.png"
+  "Substance 3D Designer\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/399.png"
+  "Substance 3D Painter\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/39B.png"
+  "Substance 3D Sampler\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/39A.png"
+  "Substance 3D Stager\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/39C.png"
+  "XD\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/088.png"
+ )
+ buildfulllist "$AD" "JQ525L2MZD" "https://ics.services.jamfcloud.com/icon/hash_bf7d2ba8b616dd30e3921ad148287604a229bd9fa22cc84b0e62b5996ff8cd02" "Required"
+}
+
+buildApple() {
+ LIST=(
+  "Garageband\t\thttps://is1-ssl.mzstatic.com/image/thumb/Purple122/v4/17/86/e5/1786e59d-56d8-4090-15e9-68e5e68114b9/AppIcon-85-220-4-2x.png/512x0w.png"
+  "iMovie\t\thttps://is1-ssl.mzstatic.com/image/thumb/Purple126/v4/ec/c2/f1/ecc2f1d5-0aa8-749a-d186-ba7f8586f622/iMovieAppIcon-85-220-0-4-2x.png/512x0w.png"
+  "Keynote\t\thttps://is1-ssl.mzstatic.com/image/thumb/Purple116/v4/fe/11/62/fe116278-7edf-8a88-1b25-e8c4ec9b498e/AppIcon-0-0-85-220-0-0-4-0-0-2x-0-0-0-0-0.png/512x0w.png"
+  "Numbers\t\thttps://is1-ssl.mzstatic.com/image/thumb/Purple116/v4/c5/f7/f4/c5f7f493-2faa-c43a-c31d-0f939d942d6a/AppIcon-0-0-85-220-0-0-4-0-0-2x-0-0-0-0-0.png/512x0w.png"
+  "Pages\t\thttps://is1-ssl.mzstatic.com/image/thumb/Purple116/v4/1a/9c/07/1a9c07d6-6b6f-5b7e-679b-d499c1fdfb44/AppIcon-0-0-85-220-0-0-4-0-0-2x-0-0-0-0-0.png/512x0w.png"
+ )
+ buildfulllist "" "Mac App Store" "" ""
+}
+
+buildMicrosoft() {
+ MSDID="UBF8T346G9"
+ MSICON="https://ics.services.jamfcloud.com/icon/hash_e3247dad6880725ff22a771beb51a910a37c1afd41c67d0d4d113c58543b9591"
+ LIST=(
+  "Defender\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/256.png"
+  "Edge\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/1D4.png"
+  "Excel\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/09C.png"
+  "OneNote\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/09F.png"
+  "Outlook\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/0A1.png"
+  "PowerPoint\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/0A3.png"
+  "Teams\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/5E3.png"
+  "Word\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/0A6.png"
+ )
+ buildfulllist "Microsoft" "$MSDID" "$MSICON" "Required"
+
+# Microsoft OneDrive & Windows App are the odd ones out, they install without the word Microsoft
+ LIST=(
+  "Windows App\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/67E.png"
+  "OneDrive\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/09D.png"
+ )
+ buildfulllist "" "$MSDID" "$MSICON" "Required"
+}
+buildMicrosoftLabs() {
+ MSDID="UBF8T346G9"
+ MSICON="https://ics.services.jamfcloud.com/icon/hash_e3247dad6880725ff22a771beb51a910a37c1afd41c67d0d4d113c58543b9591"
+ LIST=(
+  "Defender\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/256.png"
+  "Edge\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/1D4.png"
+  "Excel\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/09C.png"
+  "OneNote\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/09F.png"
+  "PowerPoint\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/0A3.png"
+  "Word\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/0A6.png"
+ )
+ buildfulllist "Microsoft" "$MSDID" "$MSICON" "Required"
+
+# Microsoft OneDrive & Windows App are the odd ones out, they install without the word Microsoft
+ LIST=(
+  "Windows App\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/67E.png"
+  "OneDrive\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/09D.png"
+ )
+ buildfulllist "" "$MSDID" "$MSICON" "Required"
+}
+
+buildStandard() {
+ LIST=(
+  "Chrome\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/0BC.png"
+ )
+ buildfulllist "Google" "EQHXZ8M8AV" "" "Required"
+ LIST=(
+  "Firefox\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/0B3.png"
+ )
+ buildfulllist "" "43AQ936H96" "" "Required"
+ LIST=(
+  "Panopto\t\thttps://ics.services.jamfcloud.com/icon/hash_501ee926d93076375e3e83ae51d3ea294b3657423b47375ae7ade306f259a383"
+ )
+ buildfulllist "" "G7FR783UED" "" "Required"
+ LIST=(
+  "VLC\t\thttps://ics.services.jamfcloud.com/icon/hash_c2b112a6ee0833dfca4a54f31c828bba95ca0b703249d2a582b96b42747914c9"
+ )
+ buildfulllist "" "75GAHG3SZQ" "" "Required"
+ LIST=(
+  "zoom.us\t\thttps://appinstallers-packages.services.jamfcloud.com/icons/0F9.png"
+ )
+ buildfulllist "" "BJ4HAAB9B3" "" "Required"
+ LIST=(
+  "Support\t\t"
+ )
+ buildfulllist "" "98LJ4XBGYK" "" "Required"
+}
+
+buildFASS() {
+ LIST=(
+  "4K Video Downloader\t\t"
+  "4K YouTube to MP3\t\t"
+ )
+ buildfulllist "" "GHQ37VJF83" "" ""
+ LIST=(
+  "Blender\t\t"
+ )
+ buildfulllist "" "68UA947AUU" "" ""
+ LIST=(
+  "Dragonframe\tDragonframe 5/Dragonframe 5\t"
+ )
+ buildfulllist "" "PG7SM8SD8M" "" ""
+ LIST=(
+  "Isadora\t\t"
+ )
+ buildfulllist "" "5V96MD6S6" "" ""
+}
+
+buildFCMS() {
+ LIST=(
+  "Beam Studio\t\t"
+ )
+ buildfulllist "" "4Y92JWKV94" "" ""
+ LIST=(
+  "Figma\t\t"
+ )
+ buildfulllist "" "T8RA8NE3B7" "" ""
+ LIST=(
+  "JASP\t\t"
+ )
+ buildfulllist "" "AWJJ3YVK9B" "" ""
+ LIST=(
+  "Processing\t\t"
+ )
+ buildfulllist "" "6297K33652" "" ""
+ LIST=(
+  "Ultimaker Cura\t\t"
+ )
+ buildfulllist "" "V4B3JXRRQS" "" ""
+}
+
+
+case "$LISTNAME" in
+ Adobe)
+  buildAdobe
+ ;;
+ Apple)
+  buildApple
+ ;;
+ FASS)
+  buildFASS
+ ;;
+ FCMS)
+  buildFCMS
+ ;;
+ Microsoft)
+  buildMicrosoft
+ ;;
+ MicrosoftLabs)
+  buildMicrosoftLabs
+ ;;
+ Standard)
+  buildStandard
+ ;;
+ *)
+  if [ "$LISTNAME" = "" ]; then
+   echo "ERROR: please select a list in \$4 (Adobe, Apple, Microsoft, MicrosoftLabs, Standard, FASS, or FCMS)"
+   exit 1
+  fi
+  LIST=( "$LISTNAME\t$APPFULLPATH\t$STDICON" )
+  buildfulllist "" "$SUPTEAMID" "$STDICON" "$REQUIRED"
+ ;;
+esac
